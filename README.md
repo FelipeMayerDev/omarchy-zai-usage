@@ -8,13 +8,13 @@ writes the Z.ai record there.
 ## Install
 
 ```bash
-omarchy plugin add <this-repo-url> --enable
+omarchy plugin add https://github.com/FelipeMayerDev/omarchy-zai-usage --enable
 ```
 
 Or by hand:
 
 ```bash
-git clone <this-repo-url> ~/.config/omarchy/plugins/zai.agent-usage
+git clone https://github.com/FelipeMayerDev/omarchy-zai-usage ~/.config/omarchy/plugins/zai.agent-usage
 omarchy-shell shell rescanPlugins
 omarchy plugin enable zai.agent-usage
 ```
