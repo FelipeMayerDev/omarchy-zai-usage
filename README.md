@@ -60,3 +60,16 @@ The collector looks for an API key in this order:
   `omarchy plugin remove zai.agent-usage`. Removing the plugin leaves the
   last `zai.json` behind; delete `~/.local/state/omarchy/agents/usage/zai.json`
   if you want the tab gone immediately.
+
+## Dependencies
+
+- `python3` (stdlib only — the collector uses no pip packages)
+- `jq` (ships with Omarchy's default package set; used by `refresh.sh` to
+  sanity-check the record before it lands)
+- A Z.ai or Zhipu API key for Coding Plan limits; local token stats work
+  without one
+
+## License
+
+MIT — see [LICENSE](LICENSE). The Z.ai mark in `assets/` is Z.AI's brand,
+used to identify the service this plugin connects to.
