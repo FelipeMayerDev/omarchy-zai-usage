@@ -8,7 +8,7 @@
 plugin_dir="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 usage_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
 
-record=$("$plugin_dir/omarchy-agent-usage-zai") || exit 1
+record=$(timeout 120 "$plugin_dir/omarchy-agent-usage-zai") || exit 1
 if [[ -z $record ]] || ! jq -e . >/dev/null 2>&1 <<<"$record"; then
   echo "zai.agent-usage: collector emitted no valid JSON record" >&2
   exit 1

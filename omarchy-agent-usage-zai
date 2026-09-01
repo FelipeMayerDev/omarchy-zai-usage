@@ -287,7 +287,9 @@ def fetch_limits(api_key: str, platform: str) -> dict[str, Any]:
   )
   try:
     with urllib.request.urlopen(request, timeout=15) as response:
-      body = json.load(response)
+      # Real payloads are a few KB; a 1 MiB ceiling stops a hostile or broken
+      # server from making us allocate unbounded.
+      body = json.loads(response.read(1_048_576))
   except urllib.error.HTTPError as error:
     if error.code in (401, 403):
       return {"status": "Z.ai rejected the API key", "keyRejected": True}
@@ -299,7 +301,7 @@ def fetch_limits(api_key: str, platform: str) -> dict[str, Any]:
 
   data = body.get("data") if isinstance(body, dict) else None
   if not isinstance(data, dict) or not isinstance(data.get("limits"), list):
-    msg = str(body.get("msg") or "").strip() if isinstance(body, dict) else ""
+    msg = str(body.get("msg") or "").strip()[:200] if isinstance(body, dict) else ""
     status = "No GLM Coding Plan on this key" if "coding plan" in msg.lower() else (
       msg or "Coding Plan limits unavailable"
     )
@@ -330,7 +332,7 @@ def fetch_limits(api_key: str, platform: str) -> dict[str, Any]:
       "resetsAt": iso_from_ms(item.get("nextResetTime")),
     })
 
-  tier = str(data.get("level") or "").strip()
+  tier = str(data.get("level") or "").strip()[:64]
   return {"limits": limits, "tierLabel": tier[:1].upper() + tier[1:].lower() if tier else ""}
 
 
@@ -378,19 +380,32 @@ def collect_limits(api_key: str, platform: str, force: bool) -> dict[str, Any]:
     result["limits"], result["tierLabel"] = fallback, cached_tier
     return result
 
-  probe = fetch_limits(api_key, platform)
-  if probe.get("limits"):
-    result["limits"] = probe["limits"]
-    result["tierLabel"] = probe.get("tierLabel", "")
-    try:
-      write_json(probe_cache, {
-        "fetchedAtMs": round(time.time() * 1000),
-        "limits": probe["limits"],
-        "tierLabel": result["tierLabel"],
-      })
-    except Exception as exc:
-      print(f"omarchy-agent-usage-zai: could not write limits cache ({exc})", file=sys.stderr)
-    return result
+  # flock serializes probes like the scan does: a concurrent --limits-only that
+  # just finished probing re-fills the cache, so re-check freshness under the
+  # lock instead of hammering the endpoint from both processes.
+  with scan_cache_paths()[2].open("w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if not force:
+      cached = read_fresh_json(probe_cache, float("inf")) or {}
+      fetched_at = number(cached.get("fetchedAtMs")) / 1000 if isinstance(cached, dict) else 0
+      fresh = usable_cached_limits(cached) if isinstance(cached, dict) else []
+      if fresh and time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
+        result["limits"], result["tierLabel"] = fresh, str(cached.get("tierLabel") or "")
+        return result
+
+    probe = fetch_limits(api_key, platform)
+    if probe.get("limits"):
+      result["limits"] = probe["limits"]
+      result["tierLabel"] = probe.get("tierLabel", "")
+      try:
+        write_json(probe_cache, {
+          "fetchedAtMs": round(time.time() * 1000),
+          "limits": probe["limits"],
+          "tierLabel": result["tierLabel"],
+        })
+      except Exception as exc:
+        print(f"omarchy-agent-usage-zai: could not write limits cache ({exc})", file=sys.stderr)
+      return result
 
   # No fresh limits. A transport failure reached no server — typically the
   # seconds after login before the network is up — so ask the shell to retry
@@ -509,12 +524,12 @@ def scan_sessions() -> dict[str, Any]:
   }
 
 
-def scan_cache_paths() -> tuple[Path, Path]:
+def scan_cache_paths() -> tuple[Path, Path, Path]:
   # The digest covers every data path the scan reads (both session roots live
   # under the home directory).
   digest = hashlib.sha1(str(Path.home()).encode("utf-8")).hexdigest()[:16]
   root = cache_root()
-  return root / f"zai-scan-{digest}.json", root / f"zai-scan-{digest}.lock"
+  return root / f"zai-scan-{digest}.json", root / f"zai-scan-{digest}.lock", root / "zai-limits.lock"
 
 
 def read_cached_stats(cache_file: Path, max_age_seconds: float) -> dict[str, Any] | None:
@@ -554,7 +569,7 @@ def cached_local_stats(max_age: float) -> dict[str, Any]:
 
 
 def _cached_local_stats(max_age: float) -> dict[str, Any]:
-  cache_file, lock_file = scan_cache_paths()
+  cache_file, lock_file, _ = scan_cache_paths()
 
   cached = read_cached_stats(cache_file, max_age)
   if cached is not None:
