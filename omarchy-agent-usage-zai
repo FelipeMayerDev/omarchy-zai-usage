@@ -20,10 +20,12 @@ agents panel only ever reads the JSON this prints.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import time
@@ -31,7 +33,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 AGENT_ID = "zai"
 AGENT_NAME = "Z.ai"
@@ -179,6 +181,52 @@ def write_json(path: Path, payload: Any) -> None:
   except BaseException:
     tmp.unlink(missing_ok=True)
     raise
+
+
+@contextlib.contextmanager
+def exclusive_lock(path: Path) -> Iterator[None]:
+  """Hold flock on `path` for the block, or run the block unlocked.
+
+  The lock names are predictable paths in a user-writable directory, so what
+  sits at the path may not be this plugin's own file. The open follows no
+  symlinks, creates exclusively, truncates nothing (a lock carries no
+  content) and blocks on nothing (a planted fifo must not hang the run);
+  fstat then confirms a regular file, owned by this user, without group or
+  other write bits. Anything else — including a symlink planted at the
+  path — means no lock: the lock only serializes concurrent collectors, and
+  running without it beats both refusing to run and touching the target.
+  """
+  fd: int | None = None
+  try:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+      fd = os.open(path, flags | os.O_EXCL, 0o600)
+    except FileExistsError:
+      fd = os.open(path, flags)
+    info = os.fstat(fd)
+    if (
+      not stat.S_ISREG(info.st_mode)
+      or info.st_nlink == 0
+      or info.st_uid != os.geteuid()
+      or info.st_mode & 0o022
+    ):
+      os.close(fd)
+      fd = None
+  except OSError:
+    if fd is not None:
+      os.close(fd)
+    fd = None
+  if fd is not None:
+    try:
+      fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+      os.close(fd)
+      fd = None
+  try:
+    yield
+  finally:
+    if fd is not None:
+      os.close(fd)
 
 
 # --------------------------------------------------------------------------
@@ -383,8 +431,7 @@ def collect_limits(api_key: str, platform: str, force: bool) -> dict[str, Any]:
   # flock serializes probes like the scan does: a concurrent --limits-only that
   # just finished probing re-fills the cache, so re-check freshness under the
   # lock instead of hammering the endpoint from both processes.
-  with scan_cache_paths()[2].open("w") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
+  with exclusive_lock(scan_cache_paths()[2]):
     if not force:
       cached = read_fresh_json(probe_cache, float("inf")) or {}
       fetched_at = number(cached.get("fetchedAtMs")) / 1000 if isinstance(cached, dict) else 0
@@ -575,8 +622,7 @@ def _cached_local_stats(max_age: float) -> dict[str, Any]:
   if cached is not None:
     return cached
 
-  with lock_file.open("w") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
+  with exclusive_lock(lock_file):
     cached = read_cached_stats(cache_file, max_age)
     if cached is not None:
       return cached

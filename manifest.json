@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "zai.agent-usage",
   "name": "Z.ai Agent Usage",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "Felipe Mayer",
   "description": "Feeds Z.ai GLM Coding Plan usage into the built-in agents panel.",
   "kinds": [
