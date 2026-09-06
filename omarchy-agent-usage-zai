@@ -5,16 +5,23 @@
 """Collect Z.ai (GLM Coding Plan) usage into one display-ready JSON record.
 
 Rate limits and the plan tier come from Z.ai's coding-plan monitor endpoint
-(…/api/monitor/usage/quota/limit), which reports the rolling 5-hour and weekly
-token windows. That endpoint only answers for keys that carry a Coding Plan; a
-generic pay-as-you-go key gets "no coding plan" and the record falls back to
-local stats alone, exactly like the claude collector without a signed-in CLI.
+(…/api/monitor/usage/quota/limit), which reports the rolling 5-hour token
+window, the weekly window when the plan has one, and the subscription-cycle
+usage-points allowance; the record lists them nearest-reset-first so the
+panel leads with the live session window. That endpoint only answers for keys that carry a
+Coding Plan; a generic pay-as-you-go key gets "no coding plan" and the record
+falls back to local stats alone, exactly like the claude collector without a
+signed-in CLI.
 
-Local stats come from pi/omp sessions that ran through the Z.ai provider (the
-`glm-*` models). Both the local scan and the network probe are cached: the
-panel fires `--limits-only` on every open, so a repeated open must reuse a
-recent scan and must not re-probe Z.ai more than once every few seconds. The
-agents panel only ever reads the JSON this prints.
+Local stats come from pi/omp sessions that ran through a Z.ai provider
+(`zai`, `zai-coding-cn`, `zhipu`; the `glm-*` models) and from opencode
+sessions that ran on a Z.ai provider. Credentials resolve from
+~/.config/omarchy/agents/zai.json, ZAI_API_KEY/ZHIPU_API_KEY, the live
+~/.pi/agent/auth.json (or omp twin) written by `pi auth login`, and the
+~/.pi|~/.omp agent .env files. Both the local scan and the network probe are
+cached: the panel fires `--limits-only` on every open, so a repeated open must
+reuse a recent scan and must not re-probe Z.ai more than once every few
+seconds. The agents panel only ever reads the JSON this prints.
 """
 
 from __future__ import annotations
@@ -50,11 +57,14 @@ PLATFORMS = {
 QUOTA_PATH = "/api/monitor/usage/quota/limit"
 
 # Coding-plan limit windows are tagged by (unit, number); the monitor endpoint
-# reports one CREDIT_LIMIT row per window (older responses used TOKENS_LIMIT).
-LIMIT_TYPES = {"CREDIT_LIMIT", "TOKENS_LIMIT"}
+# reports one CREDIT_LIMIT row per token window (older responses used
+# TOKENS_LIMIT) plus a TIME_LIMIT row for the subscription-cycle usage-points
+# allowance.
+LIMIT_TYPES = {"CREDIT_LIMIT", "TOKENS_LIMIT", "TIME_LIMIT"}
 LIMIT_WINDOWS = {
   (3, 5): "Session (5-hour)",
   (6, 1): "Weekly (7-day)",
+  (5, 1): "Monthly cycle",
 }
 
 # A scan this recent is only reused to dedup concurrent collector runs (the
@@ -274,6 +284,25 @@ def credentials() -> tuple[str, str]:
       platform = platform or "zhipu"
 
   if not key:
+    # Live credentials stored by pi/omp `auth login`: auth.json holds one
+    # credential per provider, so both the global plan (zai) and the China
+    # plan (zai-coding-cn → open.bigmodel.cn) resolve from the same file.
+    for auth_path in (
+      Path.home() / ".pi" / "agent" / "auth.json",
+      Path.home() / ".omp" / "agent" / "auth.json",
+    ):
+      try:
+        parsed = json.loads(auth_path.read_text())
+      except (OSError, json.JSONDecodeError):
+        continue
+      if not isinstance(parsed, dict):
+        continue
+      for provider_id, platform_id in (("zai", "zai"), ("zai-coding-cn", "zhipu")):
+        credential = parsed.get(provider_id)
+        if isinstance(credential, dict) and str(credential.get("key") or "").strip():
+          return str(credential["key"]).strip(), platform_id
+
+  if not key:
     for env_path in (
       Path.home() / ".omp" / "agent" / ".env",
       Path.home() / ".pi" / "agent" / ".env",
@@ -360,6 +389,10 @@ def fetch_limits(api_key: str, platform: str) -> dict[str, Any]:
     if not isinstance(item, dict) or item.get("type") not in LIMIT_TYPES:
       continue
     label = LIMIT_WINDOWS.get((item.get("unit"), item.get("number")))
+    if not label and item.get("type") == "TIME_LIMIT":
+      # The cycle row's (unit, number) has moved before; an unmapped cycle
+      # still renders with a generic label rather than disappearing.
+      label = "Usage cycle"
     if not label:
       # A window Z.ai adds later would vanish silently otherwise.
       print(
@@ -368,17 +401,41 @@ def fetch_limits(api_key: str, platform: str) -> dict[str, Any]:
         file=sys.stderr,
       )
       continue
+    # Prefer the exact ratio (used / granted): the rounded percentage reads
+    # 0% for the first few dozen points of a 4000-point cycle, and a false 0%
+    # meter reads as a fresh allowance, which is worse than a lower row.
+    percent: float | None = None
     try:
-      percent = max(0.0, min(1.0, float(item.get("percentage")) / 100.0))
+      granted, used = float(item.get("usage")), float(item.get("currentValue"))
+      if granted > 0 and used >= 0:
+        percent = max(0.0, min(1.0, used / granted))
     except (TypeError, ValueError):
-      # A missing/unparseable percentage is skipped: a false 0% meter reads
-      # as a fresh allowance, which is worse than showing one fewer window.
-      continue
+      pass
+    if percent is None:
+      try:
+        percent = max(0.0, min(1.0, float(item.get("percentage")) / 100.0))
+      except (TypeError, ValueError):
+        # A missing/unparseable percentage is skipped: a false 0% meter reads
+        # as a fresh allowance, which is worse than showing one fewer window.
+        continue
     limits.append({
       "label": label,
       "percent": percent,
       "resetsAt": iso_from_ms(item.get("nextResetTime")),
     })
+
+  # The rolling session window is the binding constraint of the moment, so
+  # the panel list leads with it: order by reset horizon — the 5-hour session
+  # window resets within hours, the weekly window within days, the usage
+  # cycle within a month — and unknown horizons sink to the end.
+  def reset_horizon(entry: dict[str, Any]) -> float:
+    raw = str(entry.get("resetsAt") or "")
+    try:
+      return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+      return float("inf")
+
+  limits.sort(key=reset_horizon)
 
   tier = str(data.get("level") or "").strip()[:64]
   return {"limits": limits, "tierLabel": tier[:1].upper() + tier[1:].lower() if tier else ""}
@@ -473,35 +530,65 @@ def collect_limits(api_key: str, platform: str, force: bool) -> dict[str, Any]:
 # Local session stats
 # --------------------------------------------------------------------------
 
-def scan_sessions() -> dict[str, Any]:
-  recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+# The aggregation state is module-level so the pi/omp scan and the opencode
+# scan contribute to the same totals; reset_stats() scopes one scan run.
+_stats_state: dict[str, Any] = {}
 
-  model_usage: dict[str, dict[str, int]] = {}
-  today_by_model: dict[str, int] = {}
-  active_dates: set[str] = set()
-  total_sessions: set[str] = set()
-  today_sessions: set[str] = set()
-  seen: set[str] = set()
-  totals = {"today_prompts": 0, "today_tokens": 0, "total_prompts": 0}
 
-  def add_usage(day, session_key, model, inp, out, cread, cwrite):
-    total = inp + out + cread + cwrite
-    totals["total_prompts"] += 1
-    total_sessions.add(session_key)
-    active_dates.add(day)
-    bucket = model_usage.setdefault(model, empty_bucket())
-    bucket["inputTokens"] += inp
-    bucket["outputTokens"] += out
-    bucket["cacheReadInputTokens"] += cread
-    bucket["cacheCreationInputTokens"] += cwrite
-    if day in recent:
-      recent[day]["messageCount"] += total
-    if day == today:
-      totals["today_prompts"] += 1
-      today_sessions.add(session_key)
-      totals["today_tokens"] += total
-      today_by_model[model] = today_by_model.get(model, 0) + total
+def reset_stats() -> None:
+  _stats_state.clear()
+  _stats_state.update({
+    "recent": {day: {"date": day, "messageCount": 0} for day in recent_dates},
+    "model_usage": {},
+    "today_by_model": {},
+    "active_dates": set(),
+    "total_sessions": set(),
+    "today_sessions": set(),
+    "seen": set(),
+    "today_prompts": 0,
+    "today_tokens": 0,
+    "total_prompts": 0,
+  })
 
+
+def record_usage(day: str, session_key: str, model: str, inp: int, out: int, cread: int, cwrite: int) -> None:
+  total = inp + out + cread + cwrite
+  state = _stats_state
+  state["total_prompts"] += 1
+  state["total_sessions"].add(session_key)
+  state["active_dates"].add(day)
+  bucket = state["model_usage"].setdefault(model, empty_bucket())
+  bucket["inputTokens"] += inp
+  bucket["outputTokens"] += out
+  bucket["cacheReadInputTokens"] += cread
+  bucket["cacheCreationInputTokens"] += cwrite
+  if day in state["recent"]:
+    state["recent"][day]["messageCount"] += total
+  if day == today:
+    state["today_prompts"] += 1
+    state["today_sessions"].add(session_key)
+    state["today_tokens"] += total
+    state["today_by_model"][model] = state["today_by_model"].get(model, 0) + total
+
+
+def build_stats() -> dict[str, Any]:
+  state = _stats_state
+  return {
+    "hasLocalStats": bool(state["model_usage"]),
+    "todayPrompts": state["today_prompts"],
+    "todaySessions": len(state["today_sessions"]),
+    "todayTotalTokens": state["today_tokens"],
+    "todayTokensByModel": state["today_by_model"],
+    "recentDays": [state["recent"][day] for day in recent_dates],
+    "totalPrompts": state["total_prompts"],
+    "totalSessions": len(state["total_sessions"]),
+    "activeDays": len(state["active_dates"]),
+    "activeDates": sorted(state["active_dates"]),
+    "modelUsage": state["model_usage"],
+  }
+
+
+def scan_pi_sessions() -> None:
   roots = [
     Path.home() / ".pi" / "agent" / "sessions",
     Path.home() / ".omp" / "agent" / "sessions",
@@ -517,8 +604,9 @@ def scan_sessions() -> dict[str, Any]:
       with handle:
         for line in handle:
           # Cheap substring gate before the JSON parse: an assistant turn on a
-          # Z.ai provider always carries both markers.
-          if '"usage"' not in line or ('"zai"' not in line and '"zhipu"' not in line):
+          # Z.ai provider always carries both markers. The zai gate has no
+          # closing quote so the zai-coding-cn provider passes it too.
+          if '"usage"' not in line or ('"zai' not in line and '"zhipu' not in line):
             continue
           try:
             entry = json.loads(line)
@@ -534,7 +622,7 @@ def scan_sessions() -> dict[str, Any]:
           # Exact provider match: a custom `zai-proxy` gateway is not this
           # subscription, the same discipline the stock collectors keep.
           provider = str(message.get("provider") or "").lower()
-          if provider not in ("zai", "zhipu"):
+          if provider not in ("zai", "zhipu", "zai-coding-cn"):
             continue
           usage = message.get("usage")
           if not isinstance(usage, dict):
@@ -549,26 +637,77 @@ def scan_sessions() -> dict[str, Any]:
           if not (inp or out or cread or cwrite):
             continue
           message_key = str(path) + ":" + str(entry.get("id") or "")
-          if message_key in seen:
+          if message_key in _stats_state["seen"]:
             continue
-          seen.add(message_key)
+          _stats_state["seen"].add(message_key)
           day = local_day(entry.get("timestamp") or message.get("timestamp"))
           model = str(message.get("model") or "glm")
-          add_usage(day, str(path), model, inp, out, cread, cwrite)
+          record_usage(day, str(path), model, inp, out, cread, cwrite)
 
-  return {
-    "hasLocalStats": bool(model_usage),
-    "todayPrompts": totals["today_prompts"],
-    "todaySessions": len(today_sessions),
-    "todayTotalTokens": totals["today_tokens"],
-    "todayTokensByModel": today_by_model,
-    "recentDays": [recent[day] for day in recent_dates],
-    "totalPrompts": totals["total_prompts"],
-    "totalSessions": len(total_sessions),
-    "activeDays": len(active_dates),
-    "activeDates": sorted(active_dates),
-    "modelUsage": model_usage,
-  }
+
+def scan_opencode_sessions() -> bool:
+  """Count opencode messages that ran on a Z.ai provider.
+
+  A subscription burned entirely through opencode leaves no pi session
+  files, but opencode records per-message provider, model, and token usage
+  in its own database. Read-only: opencode may be writing right now.
+  Returns whether the scan ran to completion: a scan cut short by a
+  database error still contributes what it read, but must not be cached
+  as if it were the whole story.
+  """
+  import sqlite3
+
+  db = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode" / "opencode.db"
+  if not db.is_file():
+    return True
+  try:
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+  except sqlite3.Error:
+    return False
+  try:
+    conn.execute("PRAGMA query_only = ON")
+    # LIKE gates skip rows whose JSON cannot hold the pair, avoiding the
+    # parse of tens-of-MB blobs; json_extract on json_valid rows is the
+    # authority. One malformed row must not abort the scan: the per-row
+    # try/except stays the final safety net.
+    for session_id, raw in conn.execute(
+      "SELECT session_id, data FROM message"
+      " WHERE data LIKE '%\"providerID\"%:%\"zai\"%'"
+      " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END = 'assistant'"
+      " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.providerID') END IN ('zai', 'zhipu')"
+    ):
+      try:
+        entry = json.loads(raw)
+        if not isinstance(entry, dict) or entry.get("role") != "assistant":
+          continue
+        tokens = entry.get("tokens") or {}
+        cache = tokens.get("cache") or {}
+        inp = number(tokens.get("input"))
+        # opencode keeps thinking tokens out of output; both are generated.
+        out = number(tokens.get("output")) + number(tokens.get("reasoning"))
+        cread = number(cache.get("read"))
+        cwrite = number(cache.get("write"))
+        if not (inp or out or cread or cwrite):
+          continue
+        day = local_day((entry.get("time") or {}).get("created"))
+        model = str(entry.get("modelID") or "glm").rstrip("/").split("/")[-1] or "glm"
+      except Exception:
+        continue
+      record_usage(day, "opencode:" + str(session_id), model, inp, out, cread, cwrite)
+  except sqlite3.Error:
+    # Transient lock, schema migration, corruption: the numbers stop here,
+    # incomplete.
+    return False
+  finally:
+    conn.close()
+  return True
+
+
+def scan_sessions() -> tuple[dict[str, Any], bool]:
+  reset_stats()
+  scan_pi_sessions()
+  complete = scan_opencode_sessions()
+  return build_stats(), complete
 
 
 def scan_cache_paths() -> tuple[Path, Path, Path]:
@@ -612,7 +751,8 @@ def cached_local_stats(max_age: float) -> dict[str, Any]:
     return _cached_local_stats(max_age)
   except Exception as exc:
     print(f"omarchy-agent-usage-zai: cache unavailable ({exc}); scanning directly", file=sys.stderr)
-    return scan_sessions()
+    stats, _ = scan_sessions()
+    return stats
 
 
 def _cached_local_stats(max_age: float) -> dict[str, Any]:
@@ -626,8 +766,11 @@ def _cached_local_stats(max_age: float) -> dict[str, Any]:
     cached = read_cached_stats(cache_file, max_age)
     if cached is not None:
       return cached
-    stats = scan_sessions()
-    write_cached_stats(cache_file, stats)
+    stats, complete = scan_sessions()
+    # An interrupted scan still serves this run, but caching it would
+    # suppress the missing usage for every reader until the cache expires.
+    if complete:
+      write_cached_stats(cache_file, stats)
     return stats
 
 
