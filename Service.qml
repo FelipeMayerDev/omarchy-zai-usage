@@ -8,11 +8,11 @@ import Quickshell.Io
 Item {
   id: root
 
-  // Injected by omarchy-shell (the plugin loader).
-  property var shell: null
-  property var manifest: null
-
-  readonly property string pluginDir: (manifest && manifest.__sourceDir) || ""
+  readonly property string pluginDir: {
+    var dir = String(Qt.resolvedUrl("."))
+    if (dir.indexOf("file://") === 0) dir = dir.substring(7)
+    return dir.replace(/\/$/, "")
+  }
 
   // Matches the agents panel's default refreshIntervalSec; the panel's own
   // refresh only regenerates first-party collectors, so this record would
