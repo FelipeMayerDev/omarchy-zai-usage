@@ -293,7 +293,9 @@ def credentials() -> tuple[str, str]:
     ):
       try:
         parsed = json.loads(auth_path.read_text())
-      except (OSError, json.JSONDecodeError):
+      # UnicodeDecodeError (not a JSONDecodeError subclass) for non-UTF-8
+      # bytes: a damaged auth.json must not abort the credential search.
+      except (OSError, ValueError):
         continue
       if not isinstance(parsed, dict):
         continue
@@ -668,13 +670,16 @@ def scan_opencode_sessions() -> bool:
     conn.execute("PRAGMA query_only = ON")
     # LIKE gates skip rows whose JSON cannot hold the pair, avoiding the
     # parse of tens-of-MB blobs; json_extract on json_valid rows is the
-    # authority. One malformed row must not abort the scan: the per-row
-    # try/except stays the final safety net.
+    # authority. The gates are independent, not a pair pattern, so JSON
+    # spacing cannot drop a row, and '"zai' stays unterminated so
+    # "zai-coding-cn" passes it too. One malformed row must not abort the
+    # scan: the per-row try/except stays the final safety net.
     for session_id, raw in conn.execute(
       "SELECT session_id, data FROM message"
-      " WHERE data LIKE '%\"providerID\"%:%\"zai\"%'"
+      " WHERE data LIKE '%\"providerID\"%'"
+      " AND (data LIKE '%\"zai%' OR data LIKE '%\"zhipu%')"
       " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END = 'assistant'"
-      " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.providerID') END IN ('zai', 'zhipu')"
+      " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.providerID') END IN ('zai', 'zai-coding-cn', 'zhipu')"
     ):
       try:
         entry = json.loads(raw)
