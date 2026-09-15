@@ -17,7 +17,13 @@ Or by hand:
 git clone https://github.com/FelipeMayerDev/omarchy-zai-usage ~/.config/omarchy/plugins/zai.agent-usage
 omarchy-shell shell rescanPlugins
 omarchy plugin enable zai.agent-usage
+sudo ~/.config/omarchy/plugins/zai.agent-usage/install-mark.sh
 ```
+
+The last step installs the Z.ai brand mark where the built-in agents panel
+resolves it; without it the tab shows the generic bar glyph instead of the
+Z.ai icon. `refresh.sh` keeps the mark installed afterwards and prints a
+reminder with this command if it ever goes missing.
 
 The Z.ai tab appears in the agents panel once the first record lands (within
 a minute of the shell starting).
