@@ -21,3 +21,17 @@ if ! printf '%s\n' "$record" >"$tmp"; then
   exit 1
 fi
 mv "$tmp" "$usage_dir/zai.json"
+
+# The panel's brand mark resolves inside the built-in agents plugin
+# (assets/zai.svg), a directory plugin updates and omarchy upgrades can
+# wipe. Reinstall whenever it goes missing; the directory is root-owned,
+# so a read-only run degrades to a one-line hint instead of failing the
+# refresh that already succeeded above.
+assets_dir=/usr/share/omarchy/shell/plugins/agents/assets
+if [[ -d $assets_dir && ! -e $assets_dir/zai.svg ]]; then
+  if install -m 644 "$plugin_dir/assets/zai.svg" "$assets_dir/zai.svg" 2>/dev/null; then
+    echo "zai.agent-usage: restored the Z.ai panel mark in $assets_dir" >&2
+  else
+    echo "zai.agent-usage: Z.ai panel mark missing; run 'sudo $plugin_dir/install-mark.sh' to restore it" >&2
+  fi
+fi

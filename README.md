@@ -53,9 +53,12 @@ The collector looks for an API key in this order:
 - The record file is swapped in atomically, so the panel never reads a
   half-written record.
 - The panel's brand mark for a tab resolves inside the built-in agents
-  plugin (`assets/<id>.svg`), which a third-party plugin can't extend, so
-  the tab shows the standard bar glyph. No Z.AI mark is bundled with this
-  plugin.
+  plugin (`assets/<id>.svg`), which a third-party plugin can't extend by
+  convention. This plugin bundles its own marks and keeps them installed:
+  `refresh.sh` reinstalls `zai.svg` whenever it goes missing (an omarchy
+  upgrade can wipe the directory), and for a guaranteed install run
+  `sudo ./install-mark.sh` once. Without the mark the tab shows the
+  standard bar glyph.
 - Disable or remove with `omarchy plugin disable zai.agent-usage` /
   `omarchy plugin remove zai.agent-usage`. Removing the plugin leaves the
   last `zai.json` behind; delete `~/.local/state/omarchy/agents/usage/zai.json`
@@ -73,4 +76,5 @@ The collector looks for an API key in this order:
 
 MIT — see [LICENSE](LICENSE). Z.AI and the Z.AI logo are trademarks of
 Z.AI; this plugin is an independent work, not affiliated with or endorsed
-by Z.AI, and redistributes none of its brand assets.
+by Z.AI. The bundled marks are minimal geometric shapes reproduced for
+identifying the provider in the user's own panel.
